@@ -32,17 +32,19 @@ protected:
 
 private:
 	/** Name of the session to send an invite for */
-	FName SessionName;
+	FName SessionName{};
 
 	/** ID of the user that will receive the invite as an AccelByte ID */
 	TSharedRef<const FUniqueNetIdAccelByteUser> RecipientId;
 
-	FString SessionId;
+	/** ID of the session to send an invite for */
+	FString SessionId{};
 
-	FVoidHandler OnSendPartyInviteSuccessDelegate;
 	void OnSendPartyInviteSuccess();
-
-	FErrorHandler OnSendPartyInviteErrorDelegate;
 	void OnSendPartyInviteError(int32 ErrorCode, const FString& ErrorMessage);
+
+	void OnSendPartyInvitePlatformSuccess(const FAccelByteModelsV2SessionInvitePlatformResponse& Result);
+	void OnSendPartyInvitePlatformError(int32 ErrorCode, const FString& ErrorMessage);
+
 };
 

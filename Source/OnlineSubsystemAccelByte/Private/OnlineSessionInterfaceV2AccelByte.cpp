@@ -65,6 +65,7 @@
 #include "Core/AccelByteError.h"
 #include "Core/AccelByteUtilities.h"
 #include <algorithm>
+#include "Platform/OnlineAccelByteNativePlatformHandler.h"
 
 #include "OnlinePresenceErrors.h"
 #include "AsyncTasks/Matchmaking/OnlineAsyncTaskAccelByteGetMyV2MatchmakingTickets.h"
@@ -88,6 +89,7 @@ using namespace AccelByte;
 
 #define ONLINE_ERROR_NAMESPACE "FOnlineSessionV2AccelByte"
 #define ACCELBYTE_P2P_TRAVEL_URL_FORMAT TEXT("accelbyte.%s:%d")
+#define SETTING_PARTYSESSION_ALWAYSJOINCODE FName(TEXT("ALWAYSJOINCODE"))
 
 FOnlineSessionInfoAccelByteV2::FOnlineSessionInfoAccelByteV2(const FString& SessionIdStr)
 	: SessionId(FUniqueNetIdAccelByteResource::Create(SessionIdStr))
@@ -762,6 +764,23 @@ void FOnlineSessionV2AccelByte::Init()
 		AddOnServerReceivedSessionDelegate_Handle(OnServerReceivedSessionDelegate);
 
 		AddAccelByteOnConnectAMSCompleteDelegate_Handle(FAccelByteOnConnectAMSCompleteDelegate::CreateThreadSafeSP(AsShared(), &FOnlineSessionV2AccelByte::OnAMSConnectedCallback));
+	}
+	else
+	{
+		FOnlineSubsystemAccelBytePtr AccelByteSubsystemPtr = AccelByteSubsystem.Pin();
+		if (!AccelByteSubsystemPtr.IsValid())
+		{
+			AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to initialize as AccelbyteSubsystem is invalid"));
+			return;
+		}
+
+		TSharedPtr<IOnlineAccelByteNativePlatformHandler> NativePlatformHandler = AccelByteSubsystemPtr->GetNativePlatformHandler();
+		if (!NativePlatformHandler.IsValid())
+		{
+			return;
+		}
+
+		NativePlatformHandler->OnNativePlatformSessionJoined.AddThreadSafeSP(SharedThis(this), &FOnlineSessionV2AccelByte::OnNativePlatformSessionJoined);
 	}
 
 	OnSessionServerCheckGetSessionDelegate = FOnSingleSessionResultCompleteDelegate::CreateThreadSafeSP(AsShared(), &FOnlineSessionV2AccelByte::OnSessionServerCheckGetSession);
@@ -1640,6 +1659,10 @@ void FOnlineSessionV2AccelByte::RegisterSessionNotificationDelegates(const FUniq
 		const F##Verb##NotificationDelegate On##Verb##NotificationDelegate = F##Verb##NotificationDelegate::CreateThreadSafeSP(SharedThis(this), &FOnlineSessionV2AccelByte::On##Verb##Notification, LocalUserNum); \
 		Lobby->SetV2##NotificationDelegateName##NotifDelegate(On##Verb##NotificationDelegate); \
 
+	// Begin Generic Session Notifications
+	BIND_LOBBY_NOTIFICATION(NativeSessionSync, NativeSessionSync);
+	//~ End Generic Session Notifications
+
 	// Begin Game Session Notifications
 	BIND_LOBBY_NOTIFICATION(GameSessionInvited, InvitedToGameSession);
 	BIND_LOBBY_NOTIFICATION(GameSessionInviteTimeout, GameSessionInvitationTimeout);
@@ -1679,6 +1702,21 @@ void FOnlineSessionV2AccelByte::RegisterSessionNotificationDelegates(const FUniq
 	//~ End Session Storage Notifications
 
 	#undef BIND_LOBBY_NOTIFICATION
+
+	// Since registering for notification delegates for a player implies that they have been logged in and are
+	// connected to lobby, we should also handle any pending invites that we have accumulated here.
+	TArray<FOnlineAccelBytePendingNativeJoin> PendingJoins = PendingNativeSessionJoins.FilterByPredicate([LocalPlayerId = FUniqueNetIdAccelByteUser::CastChecked(PlayerId)](const FOnlineAccelBytePendingNativeJoin& PendingJoin) {
+		return LocalPlayerId->GetPlatformId().Equals(PendingJoin.NativeUserId, ESearchCase::CaseSensitive);
+	});
+
+	for (const FOnlineAccelBytePendingNativeJoin& PendingJoin : PendingJoins)
+	{
+		FindSessionForNativeJoin(PlayerId
+			, PendingJoin.AccelByteSessionType
+			, PendingJoin.AccelByteSessionId
+			, PendingJoin.AccelBytePartyCode);
+		PendingNativeSessionJoins.Remove(PendingJoin);
+	}
 
 	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
 }
@@ -3441,6 +3479,18 @@ bool FOnlineSessionV2AccelByte::DestroySession(FName SessionName, const FOnDestr
 
 		const FUniqueNetIdRef SessionOwnerId = Session->LocalOwnerId.ToSharedRef();
 
+		// Be sure to destroy native platform session simultaneously
+		TSharedPtr<IOnlineAccelByteNativePlatformHandler> NativePlatformHandler = AccelByteSubsystemPtr->GetNativePlatformHandler();
+		if (NativePlatformHandler.IsValid())
+		{
+			FString* FoundNativeSessionId = AccelByteSessionIdToNativeSessionIdMap.Find(Session->GetSessionIdStr());
+			if (FoundNativeSessionId != nullptr)
+			{
+				NativePlatformHandler->LeaveSession(SessionOwnerId.Get(), SessionName, *FoundNativeSessionId);
+				AccelByteSessionIdToNativeSessionIdMap.Remove(*FoundNativeSessionId);
+			}
+		}
+
 		// Fire off call to leave session. Appropriate delegates will be fired by this method, along with clean up of sessions.
 		EAccelByteV2SessionType SessionType = GetSessionTypeFromSettings(Session->SessionSettings);
 
@@ -3821,6 +3871,17 @@ bool FOnlineSessionV2AccelByte::JoinSession(const FUniqueNetId& LocalUserId, FNa
 		return false;
 	}
 
+	EAccelByteV2SessionType SessionType = GetSessionTypeFromSettings(DesiredSession.Session.SessionSettings);
+	bool bShouldJoinByCode = false;
+	if (SessionType == EAccelByteV2SessionType::PartySession && DesiredSession.Session.SessionSettings.Get(SETTING_PARTYSESSION_ALWAYSJOINCODE, bShouldJoinByCode) && bShouldJoinByCode)
+	{
+		// This party session is marked as always join by code, grab that code and route to the party code JoinSession call
+		FString PartyCode{};
+		DesiredSession.Session.SessionSettings.Get(SETTING_PARTYSESSION_CODE, PartyCode);
+
+		return JoinSession(LocalUserId, SessionName, PartyCode);
+	}
+
 	FNamedOnlineSession* NewSession = AddNamedSession(SessionName, DesiredSession.Session);
 	NewSession->SessionState = EOnlineSessionState::Creating;
 	NewSession->LocalOwnerId = LocalUserId.AsShared();
@@ -3859,7 +3920,7 @@ bool FOnlineSessionV2AccelByte::JoinSession(const FUniqueNetId& LocalUserId, FNa
 		AccelByteSubsystemPtr->CreateAndDispatchAsyncTaskSerial<FOnlineAsyncTaskAccelByteConnectLobby>(AccelByteSubsystemPtr.Get(), LocalUserId, true);
 	}
 
-	EAccelByteV2SessionType SessionType = GetSessionTypeFromSettings(NewSession->SessionSettings);
+	SessionType = GetSessionTypeFromSettings(NewSession->SessionSettings);
 	if (SessionType == EAccelByteV2SessionType::GameSession)
 	{
 		AccelByteSubsystemPtr->CreateAndDispatchAsyncTaskSerial<FOnlineAsyncTaskAccelByteJoinV2GameSession>(AccelByteSubsystemPtr.Get()
@@ -4162,6 +4223,35 @@ bool FOnlineSessionV2AccelByte::IsPlayerP2PHost(const FUniqueNetId& LocalUserId,
 
 	const bool bIsP2PHost = (LocalUserId == SessionInfo->GetLeaderId().ToSharedRef().Get());
 	return SessionInfo->IsP2PMatchmaking() && bIsP2PHost;
+}
+
+bool FOnlineSessionV2AccelByte::IsPlayerPendingNativeJoin(const FUniqueNetId& LocalPlayerId, const EAccelByteV2SessionType& SessionType)
+{
+	AB_OSS_PTR_INTERFACE_TRACE_BEGIN(TEXT("LocalPlayerId: %s"), *LocalPlayerId.ToDebugString());
+
+	FUniqueNetIdAccelByteUserRef LocalAccelBytePlayerId = FUniqueNetIdAccelByteUser::CastChecked(LocalPlayerId);
+
+	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
+	return PendingNativeSessionJoins.ContainsByPredicate([LocalAccelBytePlayerId, SessionType](const FOnlineAccelBytePendingNativeJoin& NativeJoin) {
+		bool bMatchesSessionType = false;
+		if (SessionType == EAccelByteV2SessionType::Unknown)
+		{
+			// Unknown indicates that we want to check regardless of type, so say this matches in this case
+			bMatchesSessionType = true;
+		}
+		else if (SessionType == EAccelByteV2SessionType::PartySession && !NativeJoin.AccelBytePartyCode.IsEmpty())
+		{
+			// This is a party session since we have a valid party code in the join info
+			bMatchesSessionType = true;
+		}
+		else if (SessionType == EAccelByteV2SessionType::GameSession && NativeJoin.AccelBytePartyCode.IsEmpty())
+		{
+			// This is a party session since we have no party code associated
+			bMatchesSessionType = true;
+		}
+
+		return bMatchesSessionType && LocalAccelBytePlayerId->GetPlatformId().Equals(NativeJoin.NativeUserId, ESearchCase::IgnoreCase);
+	});
 }
 
 bool FOnlineSessionV2AccelByte::FindPlayerMemberSettings(FOnlineSessionSettings& InSettings, const FUniqueNetId& PlayerId, FSessionSettings& OutMemberSettings) const
@@ -6380,6 +6470,61 @@ void FOnlineSessionV2AccelByte::EnqueueBackendDataUpdate(const FName& SessionNam
 	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
 }
 
+void FOnlineSessionV2AccelByte::OnNativeSessionSyncNotification(FAccelByteModelsV2NativeSessionSyncNotif NativeSessionSyncEvent, int32 LocalUserNum)
+{
+	AB_OSS_PTR_INTERFACE_TRACE_BEGIN(TEXT("PlatformName: %s; PlatformSessionId: %s; SessionId: %s"), *NativeSessionSyncEvent.PlatformName, *NativeSessionSyncEvent.PlatformSessionID, *NativeSessionSyncEvent.SessionID);
+
+	// Grab ID of the user to pass to the join call
+	const FOnlineIdentityAccelBytePtr IdentityInterface = StaticCastSharedPtr<FOnlineIdentityAccelByte>(AccelByteSubsystem.Pin()->GetIdentityInterface());
+	if (!ensure(IdentityInterface.IsValid()))
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to handle native session sync notification as our identity interface is invalid!"));
+		return;
+	}
+
+	FUniqueNetIdPtr LocalUserId = IdentityInterface->GetUniquePlayerId(LocalUserNum);
+	if (!LocalUserId.IsValid())
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to handle native session sync notification as we could not get a local user ID for user index %d!"), LocalUserNum);
+		return;
+	}
+
+	// Grab local session that corresponds to the session ID provided through the native sync notification
+	FNamedOnlineSession* Session = GetNamedSessionById(NativeSessionSyncEvent.SessionID);
+	if (Session == nullptr)
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to handle native session sync notification as we could not find a session stored locally with the corresponding ID! SessionId: %s"), *NativeSessionSyncEvent.SessionID);
+		return;
+	}
+
+	// Try and find an existing native platform ID association, if exists
+	FString* ExistingPlatformId = AccelByteSessionIdToNativeSessionIdMap.Find(NativeSessionSyncEvent.SessionID);
+	if (ExistingPlatformId != nullptr && ExistingPlatformId->Equals(NativeSessionSyncEvent.PlatformSessionID))
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Already have joined this native session. Ignoring notification."), *NativeSessionSyncEvent.SessionID);
+		return;
+	}
+
+	FOnlineSubsystemAccelBytePtr AccelByteSubsystemPtr = AccelByteSubsystem.Pin();
+	if (!AccelByteSubsystemPtr.IsValid())
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to handle native session sync notification as AccelbyteSubsystem is invalid"));
+		return;
+	}
+
+	TSharedPtr<IOnlineAccelByteNativePlatformHandler> NativePlatformHandler = AccelByteSubsystemPtr->GetNativePlatformHandler();
+	if (NativePlatformHandler.IsValid())
+	{
+		// Store the association between the native session and non native session
+		AccelByteSessionIdToNativeSessionIdMap.Add(NativeSessionSyncEvent.SessionID, NativeSessionSyncEvent.PlatformSessionID);
+
+		// Join the session on the native platform
+		NativePlatformHandler->JoinSession(LocalUserId.ToSharedRef().Get(), Session->SessionName, NativeSessionSyncEvent.PlatformSessionID);
+	}
+
+	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
+}
+
 void FOnlineSessionV2AccelByte::OnInvitedToGameSessionNotification(FAccelByteModelsV2GameSessionUserInvitedEvent InviteEvent, int32 LocalUserNum)
 {
 	AB_OSS_PTR_INTERFACE_TRACE_BEGIN(TEXT("SessionId: %s"), *InviteEvent.SessionID);
@@ -8355,6 +8500,29 @@ void FOnlineSessionV2AccelByte::StorePlayerAttributes(const FUniqueNetId& LocalP
 	}
 }
 
+EAccelByteV2SessionPlatform FOnlineSessionV2AccelByte::GetSessionPlatform() const
+{
+	const FString SimplifiedPlatformName = AccelByteSubsystem.Pin()->GetNativePlatformNameString();
+	if (SimplifiedPlatformName.Equals(TEXT("PS4"), ESearchCase::IgnoreCase))
+	{
+		return EAccelByteV2SessionPlatform::PS4;
+	}
+	else if (SimplifiedPlatformName.Equals(TEXT("PS5"), ESearchCase::IgnoreCase))
+	{
+		return EAccelByteV2SessionPlatform::PS5;
+	}
+	else if (SimplifiedPlatformName.Equals(TEXT("GDK"), ESearchCase::IgnoreCase))
+	{
+		return EAccelByteV2SessionPlatform::Xbox;
+	}
+	else if (SimplifiedPlatformName.Equals(TEXT("STEAM"), ESearchCase::IgnoreCase))
+	{
+		return EAccelByteV2SessionPlatform::Steam;
+	}
+
+	return EAccelByteV2SessionPlatform::Unknown;
+}
+
 bool FOnlineSessionV2AccelByte::ServerQueryGameSessions(const FAccelByteModelsV2ServerQueryGameSessionsRequest& Request, int64 Offset, int64 Limit)
 {
 	AB_OSS_PTR_INTERFACE_TRACE_BEGIN(TEXT(""));
@@ -8976,6 +9144,201 @@ void FOnlineSessionV2AccelByte::OnCheckGameSessionDataComplete(int32 LocalUserNu
 		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Log, TEXT("Synced auto joined game session from backend"));
 		return;
 	}
+	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
+}
+
+void FOnlineSessionV2AccelByte::OnNativePlatformSessionJoined(FString PlatformUserIdStr
+	, FString SessionType
+	, FString SessionId
+	, FString PartyCode)
+{
+	AB_OSS_PTR_INTERFACE_TRACE_BEGIN(TEXT("PlatformUserIdStr: %s; SessionType: %s; SessionId: %s; PartyCode: %s"), *PlatformUserIdStr, *SessionType, *SessionId, *PartyCode);
+
+	// First, check if we are already in this session so that we don't attempt to join twice
+	if (GetNamedSessionById(SessionId) != nullptr)
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Already in session with ID '%s' locally!"), *SessionId);
+		return;
+	}
+
+	// Begin by grabbing identity interface instance and grab logged in user accounts
+	FOnlineSubsystemAccelBytePtr AccelByteSubsystemPtr = AccelByteSubsystem.Pin();
+	if (!AccelByteSubsystemPtr.IsValid())
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to handle native platform session join as AccelbyteSubsystem is invalid"));
+		return;
+	}
+	
+	FOnlineIdentityAccelBytePtr IdentityInterface = nullptr;
+	if (!ensure(FOnlineIdentityAccelByte::GetFromSubsystem(AccelByteSubsystemPtr.Get(), IdentityInterface)))
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to handle native platform session join as our identity interface instance is invalid!"));
+		return;
+	}
+
+	// Iterate through each user account to try and find an ID that matches the PlatformUserIdStr
+	FUniqueNetIdAccelByteUserPtr FoundUserId = nullptr;
+	TArray<TSharedPtr<FUserOnlineAccount>> AccelByteAccounts = IdentityInterface->GetAllUserAccounts();
+	for (const TSharedPtr<FUserOnlineAccount>& AccelByteAccount : AccelByteAccounts)
+	{
+		if (!AccelByteAccount.IsValid())
+		{
+			continue;
+		}
+
+		FUniqueNetIdAccelByteUserRef AccelByteUniqueId = FUniqueNetIdAccelByteUser::CastChecked(AccelByteAccount->GetUserId());
+		if (AccelByteUniqueId->GetPlatformId().Equals(PlatformUserIdStr, ESearchCase::IgnoreCase))
+		{
+			FoundUserId = AccelByteUniqueId;
+			break;
+		}
+	}
+
+	if (FoundUserId.IsValid())
+	{
+		// A match has been found, then move on to querying session by ID to surface to the game code
+		FindSessionForNativeJoin(FoundUserId.ToSharedRef().Get()
+			, SessionType
+			, SessionId
+			, PartyCode);
+	}
+	else
+	{
+		// Otherwise, add to the pending list and wait for player to log in to surfaces
+		FOnlineAccelBytePendingNativeJoin& NewNativeJoin = PendingNativeSessionJoins.AddDefaulted_GetRef();
+		NewNativeJoin.NativeUserId = PlatformUserIdStr;
+		NewNativeJoin.AccelByteSessionType = SessionType;
+		NewNativeJoin.AccelByteSessionId = SessionId;
+		NewNativeJoin.AccelBytePartyCode = PartyCode;
+	}
+
+	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
+}
+
+void FOnlineSessionV2AccelByte::FindSessionForNativeJoin(const FUniqueNetId& LocalUserId
+	, const FString& SessionType
+	, const FString& SessionId
+	, const FString& PartyCode)
+{
+	AB_OSS_PTR_INTERFACE_TRACE_BEGIN(TEXT("LocalUserId: %s; SessionType: %s; SessionId: %s; PartyCode: %s"), *LocalUserId.ToDebugString(), *SessionType, *SessionId, *PartyCode);
+
+	// Convert string session ID to a unique ID
+	FUniqueNetIdPtr SessionUniqueId = CreateSessionIdFromString(SessionId);
+	if (!SessionUniqueId.IsValid())
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to convert session ID string to unique ID! SessionId string: %s"), *SessionId);
+		return;
+	}
+	
+	EAccelByteV2SessionType SessionTypeEnum{};
+	if (SessionType.Equals(TEXT("party"), ESearchCase::IgnoreCase))
+	{
+		SessionTypeEnum = EAccelByteV2SessionType::PartySession;
+	}
+	else if (SessionType.Equals(TEXT("gamesession"), ESearchCase::IgnoreCase))
+	{
+		SessionTypeEnum = EAccelByteV2SessionType::GameSession;
+	}
+	else
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to convert session type string to enum type! SessionType: %s"), *SessionType);
+		return;
+	}
+
+	if (!PartyCode.IsEmpty())
+	{
+		// TODO: This is pretty hacky, but to support surfacing a party session to join through code while still using
+		// the OnSessionUserInviteAccepted delegate, we need to construct a dummy result that just contains the session
+		// ID, type, code, and a flag that signals that we need to join by code. This way, when the game code calls
+		// join session on the search result, it will be routed properly to join by code.
+		FOnlineSessionSearchResult PartySearchResult{};
+
+		TSharedRef<FOnlineSessionInfoAccelByteV2> SessionInfo = MakeShared<FOnlineSessionInfoAccelByteV2>(SessionId);
+		PartySearchResult.Session.SessionInfo = SessionInfo;
+
+		PartySearchResult.Session.SessionSettings.Set(SETTING_SESSION_TYPE, SETTING_SESSION_TYPE_PARTY_SESSION);
+		PartySearchResult.Session.SessionSettings.Set(SETTING_PARTYSESSION_CODE, PartyCode);
+		PartySearchResult.Session.SessionSettings.Set(SETTING_PARTYSESSION_ALWAYSJOINCODE, true);
+
+		FOnlineSubsystemAccelBytePtr AccelByteSubsystemPtr = AccelByteSubsystem.Pin();
+		if (!AccelByteSubsystemPtr.IsValid())
+		{
+			AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to notify game of AccelByte session to join along with native platform as AccelbyteSubsystem is invalid"));
+			return;
+		}
+
+		FOnlineIdentityAccelBytePtr IdentityInterface = nullptr;
+		if (!ensure(FOnlineIdentityAccelByte::GetFromSubsystem(AccelByteSubsystemPtr.Get(), IdentityInterface)))
+		{
+			AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to notify game of AccelByte session to join along with native platform as our identity interface instance is invalid!"));
+			return;
+		}
+
+		int32 LocalUserNum = -1;
+		if (!IdentityInterface->GetLocalUserNum(LocalUserId, LocalUserNum))
+		{
+			AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to notify game of AccelByte session to join along with native platform as we were unable to get a user index!"));
+			return;
+		}
+
+		TriggerOnSessionUserInviteAcceptedDelegates(true, LocalUserNum, LocalUserId.AsShared(), PartySearchResult);
+	}
+	else if (SessionTypeEnum == EAccelByteV2SessionType::PartySession && PartyCode.IsEmpty())
+	{
+		FOnlineSubsystemAccelBytePtr AccelByteSubsystemPtr = AccelByteSubsystem.Pin();
+		if (!AccelByteSubsystemPtr.IsValid())
+		{
+			AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to notify game of AccelByte session to join along with native platform as AccelbyteSubsystem is invalid"));
+			return;
+		}
+		const FOnSingleSessionResultCompleteDelegate OnFindSessionForNativeJoinCompleteDelegate = FOnSingleSessionResultCompleteDelegate::CreateThreadSafeSP(SharedThis(this), &FOnlineSessionV2AccelByte::OnFindSessionForNativeJoinComplete);
+		AccelByteSubsystemPtr->CreateAndDispatchAsyncTaskParallel<FOnlineAsyncTaskAccelByteFindV2PartyById>(AccelByteSubsystemPtr.Get()
+			, LocalUserId
+			, SessionUniqueId.ToSharedRef().Get()
+			, OnFindSessionForNativeJoinCompleteDelegate);
+	}
+	else if (SessionTypeEnum == EAccelByteV2SessionType::GameSession)
+	{
+		const FOnSingleSessionResultCompleteDelegate OnFindSessionForNativeJoinCompleteDelegate = FOnSingleSessionResultCompleteDelegate::CreateThreadSafeSP(SharedThis(this), &FOnlineSessionV2AccelByte::OnFindSessionForNativeJoinComplete);
+		FindSessionById(LocalUserId, SessionUniqueId.ToSharedRef().Get(), FUniqueNetIdAccelByteUser::Invalid().Get(), OnFindSessionForNativeJoinCompleteDelegate);
+	}
+
+	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
+}
+
+void FOnlineSessionV2AccelByte::OnFindSessionForNativeJoinComplete(int32 LocalUserNum, bool bWasSuccessful, const FOnlineSessionSearchResult& SessionResult)
+{
+	AB_OSS_PTR_INTERFACE_TRACE_BEGIN(TEXT("LocalUserNum: %d; bWasSuccessful: %s"), LocalUserNum, LOG_BOOL_FORMAT(bWasSuccessful));
+
+	if (!bWasSuccessful)
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to find session by ID that corresponded to native session joined."));
+		return;
+	}
+
+	FOnlineSubsystemAccelBytePtr AccelByteSubsystemPtr = AccelByteSubsystem.Pin();
+	if (!AccelByteSubsystemPtr.IsValid())
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to notify game of AccelByte session to join along with native platform as AccelbyteSubsystem is invalid"));
+		return;
+	}
+
+	FOnlineIdentityAccelBytePtr IdentityInterface = nullptr;
+	if (!ensure(FOnlineIdentityAccelByte::GetFromSubsystem(AccelByteSubsystemPtr.Get(), IdentityInterface)))
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to notify game of AccelByte session to join along with native platform as our identity interface instance is invalid!"));
+		return;
+	}
+
+	FUniqueNetIdPtr LocalUserId = IdentityInterface->GetUniquePlayerId(LocalUserNum);
+	if (!LocalUserId.IsValid())
+	{
+		AB_OSS_PTR_INTERFACE_TRACE_END_VERBOSITY(Warning, TEXT("Failed to notify game of AccelByte session to join along with native platform as we could not get a user ID for player at index %d!"), LocalUserNum);
+		return;
+	}
+
+	TriggerOnSessionUserInviteAcceptedDelegates(true, LocalUserNum, LocalUserId, SessionResult);
+
 	AB_OSS_PTR_INTERFACE_TRACE_END(TEXT(""));
 }
 

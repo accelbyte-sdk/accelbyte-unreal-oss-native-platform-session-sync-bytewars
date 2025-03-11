@@ -59,6 +59,16 @@ using namespace AccelByte;
 #define LOCTEXT_NAMESPACE "FOnlineSubsystemAccelByte"
 #define PARTY_SESSION_TYPE "party"
 
+#include "Platform/OnlineAccelByteNativePlatformHandler.h"
+#if defined(AB_XBOX_NATIVE_PLATFORM_PRESENT)
+#include "Platform/Xbox/OnlineAccelByteXboxPlatformHandler.h"
+#elif defined(AB_STEAM_NATIVE_PLATFORM_PRESENT)
+#include "Platform/Steam/OnlineAccelByteSteamPlatformHandler.h"
+#elif defined(AB_PLAYSTATION_NATIVE_PLATFORM_PRESENT)
+#include "OnlineSubsystemSony.h"
+#include "Platform/PlayStation/OnlineAccelBytePlayStationPlatformHandler.h"
+#endif
+
 void FOnlineSubsystemAccelByte::OnPostEngineInit()
 {
 	if(!AccelByteInstance.IsValid())
@@ -71,6 +81,14 @@ void FOnlineSubsystemAccelByte::OnPostEngineInit()
 
 bool FOnlineSubsystemAccelByte::Init()
 {
+	// Create the native platform handler for our OSS, if one is available
+	// #NOTE Ensure that we always do this before we create the session interface so we register delegate properly
+	NativePlatformHandler = ConstructNativePlatformHandler();
+	if (NativePlatformHandler.IsValid())
+	{
+		NativePlatformHandler->Init();
+	}
+
 	// Create each shared instance of our interface implementations, passing in ourselves as the parent
 #if AB_USE_V2_SESSIONS
 	SessionInterface = MakeShared<FOnlineSessionV2AccelByte, ESPMode::ThreadSafe>(this);
@@ -265,6 +283,12 @@ bool FOnlineSubsystemAccelByte::Shutdown()
 	GameStandardEventInterface.Reset();
 	IdentityInterface.Reset();
 
+	if (NativePlatformHandler.IsValid())
+	{
+		NativePlatformHandler->Deinit();
+		NativePlatformHandler.Reset();
+	}
+
 	if (OnPreExitDelegate.IsValid())
 	{
 		FCoreDelegates::OnPreExit.Remove(OnPreExitDelegate);
@@ -454,6 +478,11 @@ bool FOnlineSubsystemAccelByte::IsMultipleLocalUsersEnabled() const
 	return bIsMultipleLocalUsersEnabled;
 }
 
+TSharedPtr<IOnlineAccelByteNativePlatformHandler> FOnlineSubsystemAccelByte::GetNativePlatformHandler()
+{
+	return NativePlatformHandler;
+}
+
 bool FOnlineSubsystemAccelByte::IsLocalUserNumCached() const
 {
 	return bIsLocalUserNumCached;
@@ -517,6 +546,11 @@ bool FOnlineSubsystemAccelByte::Tick(float DeltaTime)
 		AuthInterface->Tick(DeltaTime);
 	}
 
+	if (NativePlatformHandler.IsValid())
+	{
+		NativePlatformHandler->Tick(DeltaTime);
+	}
+	
 	if (bVoiceInterfaceInitialized && VoiceInterface.IsValid())
 	{
 		VoiceInterface->Tick(DeltaTime);
@@ -1019,6 +1053,53 @@ void FOnlineSubsystemAccelByte::OnNativeTokenRefreshed(bool bWasSuccessful, int3
 	{
 		IdentityInterface->RefreshPlatformToken(LocalUserNum, SecondaryPlatform);
 	}
+}
+
+TSharedPtr<IOnlineAccelByteNativePlatformHandler> FOnlineSubsystemAccelByte::ConstructNativePlatformHandler()
+{
+#if defined(AB_XBOX_NATIVE_PLATFORM_PRESENT)
+	// Only load the native platform handler if the GDK subsystem is enabled
+	if (IOnlineSubsystem::IsEnabled(TEXT("GDK")))
+	{
+		return MakeShared<FOnlineAccelByteXboxNativePlatformHandler>(SharedThis(this));
+	}
+	else
+	{
+		return nullptr;
+	}
+#elif defined(AB_STEAM_NATIVE_PLATFORM_PRESENT)
+	if (IsRunningCommandlet() || IsRunningDedicatedServer())
+	{
+		// Only game client should load Steam native platform handler
+		return nullptr;
+	}
+
+	IOnlineSubsystem* SteamOSS = IOnlineSubsystem::Get(STEAM_SUBSYSTEM);
+	if (SteamOSS != nullptr)
+	{
+		return MakeShared<FOnlineAccelByteSteamNativePlatformHandler>(SharedThis(this));
+	}
+	else
+	{
+		return nullptr;
+	}
+#elif defined(AB_PLAYSTATION_NATIVE_PLATFORM_PRESENT)
+	FOnlineSubsystemModule& OSSModule = FModuleManager::GetModuleChecked<FOnlineSubsystemModule>(TEXT("OnlineSubsystem"));
+
+	// Only load the native platform handler if some form of the PlayStation online subsystem is loaded in
+	FOnlineSubsystemSony* SonySubsystem = FOnlineSubsystemSony::GetSonySubsystem();
+	if (SonySubsystem != nullptr)
+	{
+		return MakeShared<FOnlineAccelBytePlayStationNativePlatformHandler>(SharedThis(this));
+	}
+	else
+	{
+		return nullptr;
+	}
+#else
+	UE_LOG_AB(Warning, TEXT("Not constructing native platform handler as none was present for the current platform!"));
+	return nullptr;
+#endif
 }
 
 void FOnlineSubsystemAccelByte::ResetLocalUserNumCached()

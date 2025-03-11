@@ -67,6 +67,7 @@ class FOnlineAsyncTaskAccelByte;
 class FOnlineAsyncTaskManagerAccelByte;
 
 struct FAccelByteModelsNotificationMessage;
+class IOnlineAccelByteNativePlatformHandler;
 
 /** Shared pointer to the AccelByte implementation of the Session interface */
 #if AB_USE_V2_SESSIONS
@@ -299,6 +300,7 @@ PACKAGE_SCOPE:
 		, PredefinedEventInterface(nullptr)
 		, GameStandardEventInterface(nullptr)
 		, Language(FGenericPlatformMisc::GetDefaultLanguage())
+		, NativePlatformHandler(nullptr)
 		, AccelBytePluginList(TArray<FString>
 			{
 				"AccelByteUe4Sdk",
@@ -457,6 +459,12 @@ PACKAGE_SCOPE:
 	
 	bool IsMultipleLocalUsersEnabled() const;
 
+	/**
+	 * Retrieve the native platform handler associated with this subsystem. Used to handle syncing sessions and handling
+	 * platform invites. Can be nullptr if the platform doesn't have an associated handler.
+	 */
+	TSharedPtr<IOnlineAccelByteNativePlatformHandler> GetNativePlatformHandler();
+	
 	bool IsLocalUserNumCached() const;
 
 	FName GetSecondaryPlatformSubsystemName() const;
@@ -609,6 +617,11 @@ private:
 	/** The number will be incremented safely for each created Epic number */
 	FThreadSafeCounter EpicCounter;
 
+	/**
+	 * Active native platform handler, can be nullptr if on a platform that does not need a native handler
+	 */
+	TSharedPtr<IOnlineAccelByteNativePlatformHandler> NativePlatformHandler;
+
 	const TArray<FString> AccelBytePluginList;
 
 	/** AccelByte instance */
@@ -627,6 +640,8 @@ private:
 	void OnLobbyConnectionClosed(int32 StatusCode, const FString& Reason, bool WasClean, int32 InLocalUserNum, bool bIsReconnecting);
 
 	void OnLobbyReconnected(int32 InLocalUserNum);
+
+	TSharedPtr<IOnlineAccelByteNativePlatformHandler> ConstructNativePlatformHandler();
 
 	void OnLobbyReconnectAttempted(const AccelByte::FReconnectAttemptInfo& Info, int32 InLocalUserNum);
 

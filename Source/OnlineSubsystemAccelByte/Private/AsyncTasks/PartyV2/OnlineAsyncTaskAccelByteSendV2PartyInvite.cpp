@@ -6,6 +6,7 @@
 #include "OnlineSubsystemAccelByte.h"
 #include "Core/AccelByteRegistry.h"
 #include "OnlineSessionInterfaceV2AccelByte.h"
+#include "Platform/OnlineAccelByteNativePlatformHandler.h"
 #include "OnlinePredefinedEventInterfaceAccelByte.h"
 
 FOnlineAsyncTaskAccelByteSendV2PartyInvite::FOnlineAsyncTaskAccelByteSendV2PartyInvite(FOnlineSubsystemAccelByte* const InABInterface, const FUniqueNetId& InLocalUserId, const FName& InSessionName, const FUniqueNetId& InRecipientId)
@@ -32,11 +33,29 @@ void FOnlineAsyncTaskAccelByteSendV2PartyInvite::Initialize()
 	FNamedOnlineSession* OnlineSession = SessionInterface->GetNamedSession(SessionName);
 	AB_ASYNC_TASK_VALIDATE(OnlineSession != nullptr, "Failed to send invite to party session as our local session instance is invalid!");
 
-	// Now, once we know we are in this party, we want to send a request to invite the player to the party
-	OnSendPartyInviteSuccessDelegate = AccelByte::TDelegateUtils<FVoidHandler>::CreateThreadSafeSelfPtr(this, &FOnlineAsyncTaskAccelByteSendV2PartyInvite::OnSendPartyInviteSuccess);
-	OnSendPartyInviteErrorDelegate = AccelByte::TDelegateUtils<FErrorHandler>::CreateThreadSafeSelfPtr(this, &FOnlineAsyncTaskAccelByteSendV2PartyInvite::OnSendPartyInviteError);;
+	SessionId = OnlineSession->GetSessionIdStr();
+	AB_ASYNC_TASK_VALIDATE(!SessionId.Equals(TEXT("InvalidSession"), ESearchCase::IgnoreCase), "Failed to send invite to party session as our local session ID is not valid!");
+
+	// Now, once we know we are in this party, we want to send a request to invite the player to the party, sending with platform type if known
+	EAccelByteV2SessionPlatform Platform = SessionInterface->GetSessionPlatform();
 	API_FULL_CHECK_GUARD(Session);
-	Session->SendPartyInvite(OnlineSession->GetSessionIdStr(), RecipientId->GetAccelByteId(), OnSendPartyInviteSuccessDelegate, OnSendPartyInviteErrorDelegate);
+	if (Platform != EAccelByteV2SessionPlatform::Unknown)
+	{
+		AB_ASYNC_TASK_DEFINE_SDK_DELEGATES(FOnlineAsyncTaskAccelByteSendV2PartyInvite, SendPartyInvitePlatform, THandler<FAccelByteModelsV2SessionInvitePlatformResponse>);
+		ApiClient->Session.SendPartyInvitePlatform(SessionId
+			, RecipientId->GetAccelByteId()
+			, Platform
+			, OnSendPartyInvitePlatformSuccessDelegate
+			, OnSendPartyInvitePlatformErrorDelegate);
+	}
+	else
+	{
+		AB_ASYNC_TASK_DEFINE_SDK_DELEGATES(FOnlineAsyncTaskAccelByteSendV2PartyInvite, SendPartyInvite, FVoidHandler);
+		ApiClient->Session.SendPartyInvite(SessionId
+			, RecipientId->GetAccelByteId()
+			, OnSendPartyInviteSuccessDelegate
+			, OnSendPartyInviteErrorDelegate);
+	}
 
 	SessionId = OnlineSession->GetSessionIdStr();
 	AB_OSS_ASYNC_TASK_TRACE_END(TEXT(""));
@@ -86,6 +105,49 @@ void FOnlineAsyncTaskAccelByteSendV2PartyInvite::OnSendPartyInviteSuccess()
 }
 
 void FOnlineAsyncTaskAccelByteSendV2PartyInvite::OnSendPartyInviteError(int32 ErrorCode, const FString& ErrorMessage)
+{
+	UE_LOG_AB(Warning, TEXT("Failed to invite user '%s' to party as the request failed on the backend! Error code: %d; Error message: %s"), *RecipientId->ToDebugString(), ErrorCode, *ErrorMessage);
+	CompleteTask(EAccelByteAsyncTaskCompleteState::RequestFailed);
+}
+
+void FOnlineAsyncTaskAccelByteSendV2PartyInvite::OnSendPartyInvitePlatformSuccess(const FAccelByteModelsV2SessionInvitePlatformResponse& Result)
+{
+	AB_OSS_ASYNC_TASK_TRACE_BEGIN(TEXT(""));
+
+	TRY_PIN_SUBSYSTEM()
+
+	// Grab session interface to try and get native platform ID for this session
+	FOnlineSessionV2AccelBytePtr SessionInterface = nullptr;
+	if (!ensureAlways(FOnlineSessionV2AccelByte::GetFromSubsystem(SubsystemPin.Get(), SessionInterface)))
+	{
+		AB_OSS_ASYNC_TASK_TRACE_END_VERBOSITY(Warning, TEXT("Failed to get session interface instance from online subsystem!"));
+		return;
+	}
+
+	// Check if the platform ID from the response is valid, if we have a native platform handler, and if the native session
+	// ID is valid
+	TSharedPtr<IOnlineAccelByteNativePlatformHandler> NativePlatformHandler = SubsystemPin.Get()->GetNativePlatformHandler();
+	FString* FoundPlatformSessionId = SessionInterface->AccelByteSessionIdToNativeSessionIdMap.Find(SessionId);
+	if (!Result.PlatformUserID.IsEmpty() && NativePlatformHandler.IsValid() && FoundPlatformSessionId != nullptr)
+	{
+		// Make a copy of the recipient ID with the proper ID in place
+		FAccelByteUniqueIdComposite RecipientComposite = RecipientId->GetCompositeStructure();
+		RecipientComposite.PlatformId = Result.PlatformUserID;
+		FUniqueNetIdAccelByteUserRef UpdatedRecipientId = FUniqueNetIdAccelByteUser::Create(RecipientComposite);
+
+		// Send native platform invite
+		NativePlatformHandler->SendInviteToSession(UserId.ToSharedRef().Get()
+			, SessionName
+			, *FoundPlatformSessionId
+			, UpdatedRecipientId.Get());
+	}
+
+	CompleteTask(EAccelByteAsyncTaskCompleteState::Success);
+
+	AB_OSS_ASYNC_TASK_TRACE_END(TEXT(""));
+}
+
+void FOnlineAsyncTaskAccelByteSendV2PartyInvite::OnSendPartyInvitePlatformError(int32 ErrorCode, const FString& ErrorMessage)
 {
 	UE_LOG_AB(Warning, TEXT("Failed to invite user '%s' to party as the request failed on the backend! Error code: %d; Error message: %s"), *RecipientId->ToDebugString(), ErrorCode, *ErrorMessage);
 	CompleteTask(EAccelByteAsyncTaskCompleteState::RequestFailed);

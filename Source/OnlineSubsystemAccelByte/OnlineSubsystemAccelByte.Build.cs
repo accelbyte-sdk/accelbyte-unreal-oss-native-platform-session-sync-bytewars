@@ -77,7 +77,47 @@ public class OnlineSubsystemAccelByte : ModuleRules
 		});
 #endif
 
-		bool bEnableV2Sessions = false;
+		// Check all of the valid platform groups that we can build against to check if:
+		// 1. Our current build target is a part of that group
+		// 2. If that target group has a native platform binding, and whether the code for it is present
+		// If both conditions are true, then we will add the necessary defines and modules to build with that native code.
+		UnrealPlatformGroup[] PlatformGroups = UnrealPlatformGroup.GetValidGroups();
+		foreach (UnrealPlatformGroup PlatformGroup in PlatformGroups)
+		{
+			if (!Target.IsInPlatformGroup(PlatformGroup))
+			{
+				// If our current build target is not part of the current platform group, don't bother checking for existing platform code
+				continue;
+			}
+
+			if (PlatformGroup.ToString().Equals("XboxCommon") && IsNativePlatformCodePresent("Xbox"))
+			{
+				PrivateDefinitions.Add("AB_XBOX_NATIVE_PLATFORM_PRESENT");
+				PrivateDependencyModuleNames.AddRange(new string[] {
+					"OnlineSubsystemGDK",
+				});
+				break;
+			}
+			else if (PlatformGroup.ToString().Equals("Sony") && IsNativePlatformCodePresent("PlayStation"))
+			{
+                PrivateDefinitions.Add("AB_PLAYSTATION_NATIVE_PLATFORM_PRESENT");
+                PrivateDependencyModuleNames.AddRange(new string[] {
+					"OnlineSubsystemSony",
+				});
+				break;
+            }
+            else if (PlatformGroup.ToString().Equals("Desktop") && IsNativePlatformCodePresent("Steam"))
+            {
+                PrivateDefinitions.Add("AB_STEAM_NATIVE_PLATFORM_PRESENT");
+                PrivateDependencyModuleNames.AddRange(new string[] {
+					"SteamShared",
+					"Steamworks",
+				});
+				break;
+            }
+        }
+
+        bool bEnableV2Sessions = false;
 		GetBoolFromEngineConfig("OnlineSubsystemAccelByte", "bEnableV2Sessions", out bEnableV2Sessions);
 		PublicDefinitions.Add(string.Format("AB_USE_V2_SESSIONS={0}", bEnableV2Sessions ? 1 : 0));
 
@@ -103,6 +143,22 @@ public class OnlineSubsystemAccelByte : ModuleRules
 			Console.WriteLine("AccelByteDocsBuilder: documentation built successfully");
 		}
 	}
+
+	private bool IsNativePlatformCodePresent(string PlatformName)
+	{
+		string PlatformSourcePath = Path.Combine(ModuleDirectory,
+			"Private",
+			"Platform",
+			PlatformName,
+			String.Format("OnlineAccelByte{0}PlatformHandler.cpp", PlatformName)); // OnlineSubsystemAccelByte/Source/OnlineSubsystemAccelByte/Private/Platform/{PlatformName}/OnlineAccelByte{PlatformName}PlatformHandler.cpp
+		string PlatformHeaderPath = Path.Combine(ModuleDirectory,
+			"Private",
+			"Platform",
+			PlatformName,
+			String.Format("OnlineAccelByte{0}PlatformHandler.h", PlatformName)); // OnlineSubsystemAccelByte/Source/OnlineSubsystemAccelByte/Private/Platform/{PlatformName}/OnlineAccelByte{PlatformName}PlatformHandler.h
+
+		return File.Exists(PlatformSourcePath) && File.Exists(PlatformHeaderPath);
+    }
 
 	private bool GetBoolFromEngineConfig(string Section, string Key, out bool Value)
 	{

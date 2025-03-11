@@ -37,12 +37,21 @@ private:
 	/** ID of the user that will receive the invite as an AccelByte ID */
 	TSharedRef<const FUniqueNetIdAccelByteUser> RecipientId;
 
-	FString SessionId;
+	/** ID of the session that we are sending an invite for */
+	FString SessionId{};
 
 	FVoidHandler OnSendGameSessionInviteSuccessDelegate;
 	void OnSendGameSessionInviteSuccess();
 
 	FErrorHandler OnSendGameSessionInviteErrorDelegate;
 	void OnSendGameSessionInviteError(int32 ErrorCode, const FString& ErrorMessage);
+
+	void OnSendGameSessionInvitePlatformSuccess(const FAccelByteModelsV2SessionInvitePlatformResponse& Result);
+	void OnSendGameSessionInvitePlatformError(int32 ErrorCode, const FString& ErrorMessage);
+
+	/**
+	 * Get platform type enum from the current simplified subsystem name
+	 */
+	EAccelByteV2SessionPlatform GetInvitePlatformType() const;
 };
 

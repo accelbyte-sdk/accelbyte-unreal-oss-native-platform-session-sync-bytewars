@@ -47,8 +47,8 @@
  * @param SuccessType Delegate type for the success delegate
  */
 #define AB_ASYNC_TASK_DEFINE_SDK_DELEGATES(AsyncTaskClass, Verb, SuccessType) \
-	const SuccessType On##Verb##SuccessDelegate = SuccessType::CreateRaw(this, &AsyncTaskClass::On##Verb##Success); \
-	const FErrorHandler On##Verb##ErrorDelegate = FErrorHandler::CreateRaw(this, &AsyncTaskClass::On##Verb##Error);
+	const SuccessType On##Verb##SuccessDelegate = AccelByte::TDelegateUtils<SuccessType>::CreateThreadSafeSelfPtr(this, &AsyncTaskClass::On##Verb##Success); \
+	const FErrorHandler On##Verb##ErrorDelegate = AccelByte::TDelegateUtils<FErrorHandler>::CreateThreadSafeSelfPtr(this, &AsyncTaskClass::On##Verb##Error);
 
 /**
  * Convenience macro for async tasks to validate the expression evaluates to true, otherwise throwing an InvalidState error in the task.

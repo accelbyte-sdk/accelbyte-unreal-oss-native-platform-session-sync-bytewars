@@ -98,6 +98,14 @@ void FOnlineAsyncTaskAccelByteInitializePlayerAttributes::OnGetPlayerAttributesS
 
 	Attributes = Result;
 
+	FOnlineSessionV2AccelBytePtr SessionInterface = nullptr;
+	if (!ensure(FOnlineSessionV2AccelByte::GetFromSubsystem(SubsystemPin.Get(), SessionInterface)))
+	{
+		AB_OSS_ASYNC_TASK_TRACE_END_VERBOSITY(Warning, TEXT("Failed to get session interface from AccelByte subsystem!"));
+
+		return;
+	}
+
 	// Check if the platform information stored in the session services matches our current platform, as well as if the
 	// currently stored crossplay preference makes sense (player cannot have crossplay set to true if crossplay is
 	// disallowed on their local platform). If so, then we should just complete the task as there is nothing to update.
@@ -134,19 +142,29 @@ void FOnlineAsyncTaskAccelByteInitializePlayerAttributes::OnGetPlayerAttributesE
 
 void FOnlineAsyncTaskAccelByteInitializePlayerAttributes::SendAttributeUpdateRequest(const FAccelByteModelsV2PlayerAttributes& PreviousAttributes)
 {
+	TRY_PIN_SUBSYSTEM();
+
+	FOnlineSessionV2AccelBytePtr SessionInterface = nullptr;
+	if (!ensure(FOnlineSessionV2AccelByte::GetFromSubsystem(SubsystemPin.Get(), SessionInterface)))
+	{
+		AB_OSS_ASYNC_TASK_TRACE_END_VERBOSITY(Warning, TEXT("Failed to get session interface from AccelByte subsystem!"));
+
+		return;
+	}
+
 	// Start by copying over data from the previous attribute structure, while also setting current platform string to the
 	// platform type of the player's ID
 	FAccelByteModelsV2StorePlayerAttributesRequest Request{};
 	Request.CrossplayEnabled = (bIsCrossplayAllowed) ? PreviousAttributes.CrossplayEnabled : false;
-	Request.CurrentPlatform = UserId->GetPlatformType();
+	Request.CurrentPlatform = FAccelByteUtilities::GetUEnumValueAsString(SessionInterface->GetSessionPlatform()).ToUpper();
 	Request.Data = PreviousAttributes.Data;
 	Request.Platforms = PreviousAttributes.Platforms;
 	Request.Roles = PreviousAttributes.Roles;
 
 	// Check if the current platform for the player is already in the platforms array. If so, just update the ID of the
 	// user stored in the array. Otherwise, add a new element.
-	FAccelByteModelsV2PlayerAttributesPlatform* FoundPlatform = Request.Platforms.FindByPredicate([UserIdRef = UserId.ToSharedRef()](const FAccelByteModelsV2PlayerAttributesPlatform& Platform) {
-		return Platform.Name.Equals(UserIdRef->GetPlatformType());
+	FAccelByteModelsV2PlayerAttributesPlatform* FoundPlatform = Request.Platforms.FindByPredicate([SessionInterface, UserIdRef = UserId.ToSharedRef()](const FAccelByteModelsV2PlayerAttributesPlatform& Platform) {
+		return Platform.Name.Equals(FAccelByteUtilities::GetUEnumValueAsString(SessionInterface->GetSessionPlatform()).ToUpper());
 	});
 	if (FoundPlatform != nullptr)
 	{
@@ -155,7 +173,7 @@ void FOnlineAsyncTaskAccelByteInitializePlayerAttributes::SendAttributeUpdateReq
 	else
 	{
 		FAccelByteModelsV2PlayerAttributesPlatform& NewPlatform = Request.Platforms.AddDefaulted_GetRef();
-		NewPlatform.Name = UserId->GetPlatformType();
+		NewPlatform.Name = FAccelByteUtilities::GetUEnumValueAsString(SessionInterface->GetSessionPlatform()).ToUpper();
 		NewPlatform.UserID = UserId->GetPlatformId();
 	}
 

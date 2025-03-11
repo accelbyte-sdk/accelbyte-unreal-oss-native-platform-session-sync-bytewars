@@ -430,6 +430,41 @@ struct FSessionMatchmakingUser
  */
 #define USER_ID_TO_MATCHMAKING_USER_ARRAY(UserId) TArray<FSessionMatchmakingUser>{{UserId}}
 
+/**
+ * Structure representing a pending native session join that we need to get AccelByte session information for
+ */
+struct FOnlineAccelBytePendingNativeJoin
+{
+	/**
+	 * ID string of the native platform user that is attempting to join this session
+	 */
+	FString NativeUserId{};
+
+	/**
+	 * Type of the AccelByte session that corresponds to the native platform session that we are attempting to join
+	 */
+	FString AccelByteSessionType{};
+
+	/**
+	 * ID of the AccelByte session that corresponds to the native platform session that we are attempting to join
+	 */
+	FString AccelByteSessionId{};
+
+	/**
+	 * Party code for the AccelByte session that corresponds to the native platform session that we are attempting to join.
+	 * Will be blank if not joining a party session.
+	 */
+	FString AccelBytePartyCode{};
+
+	bool operator==(const FOnlineAccelBytePendingNativeJoin& Other)
+	{
+		return NativeUserId.Equals(Other.NativeUserId, ESearchCase::IgnoreCase) && 
+			AccelByteSessionType.Equals(Other.AccelByteSessionType, ESearchCase::IgnoreCase) && 
+			AccelByteSessionId.Equals(Other.AccelByteSessionId, ESearchCase::IgnoreCase) && 
+			AccelBytePartyCode.Equals(Other.AccelBytePartyCode, ESearchCase::IgnoreCase);
+	}
+};
+
 struct FOnlineSessionV2AccelBytePlayerAttributes
 {
 	/**
@@ -1061,6 +1096,16 @@ public:
 	 * Check if the player is the host of the P2P matchmaking match
 	 */
 	bool IsPlayerP2PHost(const FUniqueNetId& LocalUserId, FName SessionName);
+	
+	/**
+	 * Check whether the given local player has a native session pending join.
+	 * 
+	 * @param LocalPlayerId ID of the local player that we should check for a pending join
+	 * @param SessionType Optional parameter to check if we have a specific session type pending join, defaults to
+	 * EAccelByteV2SessionType::Unknown to indicate that we just want to know if we have any pending join
+	 * @return boolean that is true if a native session is pending join, or false otherwise
+	 */
+	bool IsPlayerPendingNativeJoin(const FUniqueNetId& LocalPlayerId, const EAccelByteV2SessionType& SessionType=EAccelByteV2SessionType::Unknown);
 
 	/**
 	 * Attempt to find a specific player's member settings entry within a FOnlineSessionSettings instance.
@@ -1576,6 +1621,9 @@ PACKAGE_SCOPE:
 	 */
 	static const FString ServerSessionIdEnvironmentVariable;
 
+	/** Mapping of AccelByte session ID strings to native platform session ID strings */
+	TMap<FString, FString> AccelByteSessionIdToNativeSessionIdMap{};
+
 	FOnlineSessionV2AccelByte(FOnlineSubsystemAccelByte* InSubsystem);
 
 	/**
@@ -1951,6 +1999,12 @@ PACKAGE_SCOPE:
 	void StorePlayerAttributes(const FUniqueNetId& LocalPlayerId, FAccelByteModelsV2PlayerAttributes&& Attributes);
 
 	/**
+	 * Get the session service platform enum for the current platform. This is different from the simplified platform name
+	 * in the subsystem, as we need to differentiate PS4 and PS5 for sync.
+	 */
+	EAccelByteV2SessionPlatform GetSessionPlatform() const;
+
+	/**
 	 * @brief Query game sessions from a server, listen for OnServerQueryGameSessionsComplete delegate for the result.
 	 *
 	 * @param Request Request for the query for filtering the result
@@ -2049,6 +2103,13 @@ private:
 	/** Stored override for a local server port to register with. */
 	int32 LocalServerPortOverride {-1};
 
+	/**
+	 * Array of pending native platform session joins that we are awaiting a user login for. If the user is already logged
+	 * in by the time the session is received by OnNativePlatformSessionJoined, OnSessionUserInviteAcceptedDelegate will be
+	 * fired immediately rather than adding to this array.
+	 */
+	TArray<FOnlineAccelBytePendingNativeJoin> PendingNativeSessionJoins{};
+
 	/** Attributes for a player using this session interface instance, contains crossplay and platform information */
 	TUniqueNetIdMap<FAccelByteModelsV2PlayerAttributes> UserIdToPlayerAttributesMap{};
 
@@ -2101,6 +2162,10 @@ private:
 
 	bool CreatePartySession(const FUniqueNetId& HostingPlayerId, const FName& SessionName, const FOnlineSessionSettings& NewSessionSettings);
 	bool CreateGameSession(const FUniqueNetId& HostingPlayerId, const FName& SessionName, const FOnlineSessionSettings& NewSessionSettings, bool bSendCreateRequest=true);
+
+	//~ Begin Generic Session Notification Handlers
+	void OnNativeSessionSyncNotification(FAccelByteModelsV2NativeSessionSyncNotif NativeSessionSyncEvent, int32 LocalUserNum);
+	//~ End Generic Session Notification Handlers
 
 	//~ Begin Game Session Notification Handlers
 	void OnInvitedToGameSessionNotification(FAccelByteModelsV2GameSessionUserInvitedEvent InviteEvent, int32 LocalUserNum);
@@ -2206,6 +2271,29 @@ private:
 		, int32 LocalUserNum
 		, bool bHasDsError=false
 		, FString DsErrorString=FString());
+	
+	/**
+	 * Handler for when our associated native platform handler has a session for us to surface to the game code. If
+	 * corresponding user is logged in, then we will immediately query for information about that session and continue.
+	 * Otherwise, it will be added to the PendingNativeSessionJoins waiting for user login.
+	 */
+	void OnNativePlatformSessionJoined(FString PlatformUserIdStr
+		, FString SessionType
+		, FString SessionId
+		, FString PartyCode);
+
+	/**
+	 * Attempts to find a session by ID that corresponds to a native session the player has joined.
+	 */
+	void FindSessionForNativeJoin(const FUniqueNetId& LocalUserId
+		, const FString& SessionType
+		, const FString& SessionId
+		, const FString& PartyCode);
+
+	/**
+	 * Handler for when an attempt to find a session by ID that corresponds to a native session completes.
+	 */
+	void OnFindSessionForNativeJoinComplete(int32 LocalUserNum, bool bWasSuccessful, const FOnlineSessionSearchResult& SessionResult);
 
 protected:
 	FNamedOnlineSession* AddNamedSession(FName SessionName, const FOnlineSessionSettings& SessionSettings) override;

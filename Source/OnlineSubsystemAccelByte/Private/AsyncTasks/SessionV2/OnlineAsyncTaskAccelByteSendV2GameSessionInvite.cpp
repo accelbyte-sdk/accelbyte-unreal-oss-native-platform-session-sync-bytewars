@@ -6,6 +6,7 @@
 #include "OnlineSubsystemAccelByte.h"
 #include "Core/AccelByteRegistry.h"
 #include "OnlineSessionInterfaceV2AccelByte.h"
+#include "Platform/OnlineAccelByteNativePlatformHandler.h"
 #include "OnlinePredefinedEventInterfaceAccelByte.h"
 
 using namespace AccelByte;
@@ -50,15 +51,35 @@ void FOnlineAsyncTaskAccelByteSendV2GameSessionInvite::Initialize()
 	OnSendGameSessionInviteErrorDelegate = TDelegateUtils<FErrorHandler>::CreateThreadSafeSelfPtr(this, &FOnlineAsyncTaskAccelByteSendV2GameSessionInvite::OnSendGameSessionInviteError);;
 	
 	SessionId = OnlineSession->GetSessionIdStr();
-	if (!IsRunningDedicatedServer())
+	AB_ASYNC_TASK_VALIDATE(!SessionId.Equals(TEXT("InvalidSession"), ESearchCase::IgnoreCase), "Failed to send game session invite as our local session ID is invalid!");
+	if (IsRunningDedicatedServer())
 	{
-		API_FULL_CHECK_GUARD(Session);
-		Session->SendGameSessionInvite(SessionId, RecipientId->GetAccelByteId(), OnSendGameSessionInviteSuccessDelegate, OnSendGameSessionInviteErrorDelegate);
+		// If this is a server, send an invite through the server API client
+		SERVER_API_CLIENT_CHECK_GUARD();
+		ServerApiClient->ServerSession.SendGameSessionInvite(SessionId, RecipientId->GetAccelByteId(), OnSendGameSessionInviteSuccessDelegate, OnSendGameSessionInviteErrorDelegate);
+		return;
+	}
+
+	// Otherwise, we need to determine the local player's current platform to see if we should attach platform info to the invite
+	EAccelByteV2SessionPlatform Platform = SessionInterface->GetSessionPlatform();
+	API_FULL_CHECK_GUARD(Session);
+	if (Platform == EAccelByteV2SessionPlatform::Unknown)
+	{
+		// Platform doesn't match any of the known ones, don't attach platform info
+		ApiClient->Session.SendGameSessionInvite(SessionId
+			, RecipientId->GetAccelByteId()
+			, OnSendGameSessionInviteSuccessDelegate
+			, OnSendGameSessionInviteErrorDelegate);
 	}
 	else
 	{
-		SERVER_API_CLIENT_CHECK_GUARD();
-		ServerApiClient->ServerSession.SendGameSessionInvite(SessionId, RecipientId->GetAccelByteId(), OnSendGameSessionInviteSuccessDelegate, OnSendGameSessionInviteErrorDelegate);
+		// Platform does match one of the known ones, send with platform attached to try and get native platform ID for the player invited
+		AB_ASYNC_TASK_DEFINE_SDK_DELEGATES(FOnlineAsyncTaskAccelByteSendV2GameSessionInvite, SendGameSessionInvitePlatform, THandler<FAccelByteModelsV2SessionInvitePlatformResponse>);
+		ApiClient->Session.SendGameSessionInvitePlatform(SessionId
+			, RecipientId->GetAccelByteId()
+			, Platform
+			, OnSendGameSessionInvitePlatformSuccessDelegate
+			, OnSendGameSessionInvitePlatformErrorDelegate);
 	}
 
 	AB_OSS_ASYNC_TASK_TRACE_END(TEXT(""));
@@ -115,6 +136,49 @@ void FOnlineAsyncTaskAccelByteSendV2GameSessionInvite::OnSendGameSessionInviteSu
 }
 
 void FOnlineAsyncTaskAccelByteSendV2GameSessionInvite::OnSendGameSessionInviteError(int32 ErrorCode, const FString& ErrorMessage)
+{
+	UE_LOG_AB(Warning, TEXT("Failed to invite user '%s' to game session as the request failed on the backend! Error code: %d; Error message: %s"), *RecipientId->ToDebugString(), ErrorCode, *ErrorMessage);
+	CompleteTask(EAccelByteAsyncTaskCompleteState::RequestFailed);
+}
+
+void FOnlineAsyncTaskAccelByteSendV2GameSessionInvite::OnSendGameSessionInvitePlatformSuccess(const FAccelByteModelsV2SessionInvitePlatformResponse& Result)
+{
+	AB_OSS_ASYNC_TASK_TRACE_BEGIN(TEXT(""));
+
+	TRY_PIN_SUBSYSTEM();
+
+	// Grab session interface to try and get native platform ID for this session
+	FOnlineSessionV2AccelBytePtr SessionInterface = nullptr;
+	if (!ensureAlways(FOnlineSessionV2AccelByte::GetFromSubsystem(SubsystemPin.Get(), SessionInterface)))
+	{
+		AB_OSS_ASYNC_TASK_TRACE_END_VERBOSITY(Warning, TEXT("Failed to get session interface instance from online subsystem!"));
+		return;
+	}
+
+	// Check if the platform ID from the response is valid, if we have a native platform handler, and if the native session
+	// ID is valid
+	TSharedPtr<IOnlineAccelByteNativePlatformHandler> NativePlatformHandler = SubsystemPin.Get()->GetNativePlatformHandler();
+	FString* FoundPlatformSessionId = SessionInterface->AccelByteSessionIdToNativeSessionIdMap.Find(SessionId);
+	if (!Result.PlatformUserID.IsEmpty() && NativePlatformHandler.IsValid() && FoundPlatformSessionId != nullptr)
+	{
+		// Make a copy of the recipient ID with the proper ID in place
+		FAccelByteUniqueIdComposite RecipientComposite = RecipientId->GetCompositeStructure();
+		RecipientComposite.PlatformId = Result.PlatformUserID;
+		FUniqueNetIdAccelByteUserRef UpdatedRecipientId = FUniqueNetIdAccelByteUser::Create(RecipientComposite);
+
+		// Send native platform invite
+		NativePlatformHandler->SendInviteToSession(UserId.ToSharedRef().Get()
+			, SessionName
+			, *FoundPlatformSessionId
+			, UpdatedRecipientId.Get());
+	}
+
+	CompleteTask(EAccelByteAsyncTaskCompleteState::Success);
+
+	AB_OSS_ASYNC_TASK_TRACE_END(TEXT(""));
+}
+
+void FOnlineAsyncTaskAccelByteSendV2GameSessionInvite::OnSendGameSessionInvitePlatformError(int32 ErrorCode, const FString& ErrorMessage)
 {
 	UE_LOG_AB(Warning, TEXT("Failed to invite user '%s' to game session as the request failed on the backend! Error code: %d; Error message: %s"), *RecipientId->ToDebugString(), ErrorCode, *ErrorMessage);
 	CompleteTask(EAccelByteAsyncTaskCompleteState::RequestFailed);
